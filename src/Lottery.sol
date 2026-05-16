@@ -28,21 +28,21 @@ contract Lottery is VRFConsumerBaseV2Plus {
 
     /// @notice Full data for a single lottery round
     struct Round {
-        RoundState state;
         uint256 startTime;
         uint256 endTime;
         uint256 ticketPrice;
         uint256 maxTicketsPerPlayer;
         uint256 minPlayers;
-        uint16 protocolFeeBps;
         uint256 prizePool;
         uint256 protocolFeeCollected;
+        uint256 vrfRequestId;
+        uint16 protocolFeeBps;
+        RoundState state;
+        bool refunded;
         address[] players; // one entry per ticket (weighted odds)
         address[] uniquePlayers; // deduplicated player addresses
         address[3] winners; // 1st, 2nd, 3rd
         uint256[3] payouts; // prize amounts per tier
-        uint256 vrfRequestId;
-        bool refunded;
     }
 
     /// @notice Owner-configurable parameters for future rounds
@@ -202,12 +202,14 @@ contract Lottery is VRFConsumerBaseV2Plus {
         if (r.state != RoundState.OPEN) revert Lottery__RoundNotOpen(roundId);
         if (block.timestamp >= r.endTime) revert Lottery__RoundNotOpen(roundId);
 
-        uint256 totalCost = r.ticketPrice * quantity;
+        uint256 price = r.ticketPrice;
+        uint256 totalCost = price * quantity;
         if (msg.value < totalCost) revert Lottery__InsufficientPayment(msg.value, totalCost);
 
         uint256 currentTickets = s_playerTickets[roundId][msg.sender];
-        if (currentTickets + quantity > r.maxTicketsPerPlayer) {
-            revert Lottery__MaxTicketsExceeded(currentTickets + quantity, r.maxTicketsPerPlayer);
+        uint256 maxPerPlayer = r.maxTicketsPerPlayer;
+        if (currentTickets + quantity > maxPerPlayer) {
+            revert Lottery__MaxTicketsExceeded(currentTickets + quantity, maxPerPlayer);
         }
 
         // Effects
@@ -216,8 +218,11 @@ contract Lottery is VRFConsumerBaseV2Plus {
         }
         s_playerTickets[roundId][msg.sender] = currentTickets + quantity;
 
-        for (uint256 i; i < quantity; ++i) {
+        for (uint256 i; i < quantity;) {
             r.players.push(msg.sender);
+            unchecked {
+                ++i;
+            }
         }
         r.prizePool += totalCost;
 
@@ -351,6 +356,10 @@ contract Lottery is VRFConsumerBaseV2Plus {
         return s_rounds[roundId];
     }
 
+    // ─────────────────────────────────────────────
+    // External — View
+    // ─────────────────────────────────────────────
+
     function getCurrentRoundId() external view returns (uint256) {
         return s_currentRoundId;
     }
@@ -423,8 +432,11 @@ contract Lottery is VRFConsumerBaseV2Plus {
         }
 
         // Store winners and payouts (Effects)
-        for (uint256 i; i < numWinners; ++i) {
+        for (uint256 i; i < numWinners;) {
             r.winners[i] = selected[i];
+            unchecked {
+                ++i;
+            }
         }
         r.payouts = payouts;
         r.state = RoundState.CLOSED;
@@ -432,9 +444,12 @@ contract Lottery is VRFConsumerBaseV2Plus {
         emit ProtocolFeeCollected(roundId, protocolFee);
 
         // Transfer prizes (Interactions last — CEI)
-        for (uint256 i; i < numWinners; ++i) {
+        for (uint256 i; i < numWinners;) {
             (bool ok,) = payable(r.winners[i]).call{value: payouts[i]}("");
             if (!ok) revert Lottery__TransferFailed(r.winners[i], payouts[i]);
+            unchecked {
+                ++i;
+            }
         }
 
         emit WinnersSelected(roundId, r.winners, r.payouts);
@@ -456,7 +471,7 @@ contract Lottery is VRFConsumerBaseV2Plus {
         winners = new address[](numWinners);
         uint256 totalTickets = tickets.length;
 
-        for (uint256 i; i < numWinners; ++i) {
+        for (uint256 i; i < numWinners;) {
             uint256 seed = randomWords[i];
             address selected;
             uint256 attempts;
@@ -467,10 +482,15 @@ contract Lottery is VRFConsumerBaseV2Plus {
             do {
                 uint256 index = uint256(keccak256(abi.encode(seed, attempts))) % totalTickets;
                 selected = tickets[index];
-                ++attempts;
+                unchecked {
+                    ++attempts;
+                }
             } while (_isDuplicate(winners, selected, i) && attempts < maxAttempts);
 
             winners[i] = selected;
+            unchecked {
+                ++i;
+            }
         }
     }
 
@@ -480,8 +500,11 @@ contract Lottery is VRFConsumerBaseV2Plus {
         pure
         returns (bool)
     {
-        for (uint256 j; j < currentIdx; ++j) {
+        for (uint256 j; j < currentIdx;) {
             if (winners[j] == candidate) return true;
+            unchecked {
+                ++j;
+            }
         }
         return false;
     }
