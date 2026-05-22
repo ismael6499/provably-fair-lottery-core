@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title Multi-Round VRF Lottery
 /// @author Agustin Acosta
@@ -10,7 +11,7 @@ import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/V
 /// Each round has a configurable time window, ticket price, and max tickets per player.
 /// Three winners are selected per round with a 50/30/20 prize split.
 /// @dev Inherits VRFConsumerBaseV2Plus which provides s_vrfCoordinator and ConfirmedOwner (onlyOwner).
-contract Lottery is VRFConsumerBaseV2Plus {
+contract Lottery is VRFConsumerBaseV2Plus, ReentrancyGuard {
     // ─────────────────────────────────────────────
     // Enums
     // ─────────────────────────────────────────────
@@ -88,6 +89,7 @@ contract Lottery is VRFConsumerBaseV2Plus {
     event ProtocolFeeCollected(uint256 indexed roundId, uint256 amount);
     event FeesWithdrawn(address indexed to, uint256 amount);
     event ConfigUpdated(uint256 ticketPrice, uint256 roundDuration, uint256 maxTicketsPerPlayer, uint256 minPlayers, uint16 protocolFeeBps);
+    event PrizeClaimed(address indexed winner, uint256 amount);
 
     // ─────────────────────────────────────────────
     // Constants
@@ -119,6 +121,7 @@ contract Lottery is VRFConsumerBaseV2Plus {
     mapping(uint256 roundId => Round) private s_rounds;
     mapping(uint256 vrfRequestId => uint256 roundId) private s_vrfRequestToRound;
     mapping(uint256 roundId => mapping(address player => uint256 tickets)) private s_playerTickets;
+    mapping(address player => uint256 balance) private s_claimablePrizes;
 
     // ─────────────────────────────────────────────
     // Constructor
@@ -277,7 +280,7 @@ contract Lottery is VRFConsumerBaseV2Plus {
 
     /// @notice Claim a refund for a cancelled round (not enough players)
     /// @param roundId The refunded round
-    function claimRefund(uint256 roundId) external {
+    function claimRefund(uint256 roundId) external nonReentrant {
         Round storage r = s_rounds[roundId];
 
         if (!r.refunded) revert Lottery__NoRefundAvailable();
@@ -294,6 +297,20 @@ contract Lottery is VRFConsumerBaseV2Plus {
         if (!ok) revert Lottery__TransferFailed(msg.sender, refundAmount);
 
         emit RefundClaimed(roundId, msg.sender, refundAmount);
+    }
+
+    /// @notice Claim accumulated prizes for the sender.
+    /// @dev Protects against reentrancy using the Checks-Effects-Interactions (CEI) pattern and nonReentrant modifier.
+    function claimPrize() external nonReentrant {
+        uint256 amount = s_claimablePrizes[msg.sender];
+        if (amount == 0) revert Lottery__NothingToWithdraw();
+
+        s_claimablePrizes[msg.sender] = 0;
+
+        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        if (!ok) revert Lottery__TransferFailed(msg.sender, amount);
+
+        emit PrizeClaimed(msg.sender, amount);
     }
 
     // ─────────────────────────────────────────────
@@ -336,7 +353,7 @@ contract Lottery is VRFConsumerBaseV2Plus {
     }
 
     /// @notice Withdraw accumulated protocol fees
-    function withdrawFees(address to) external onlyOwner {
+    function withdrawFees(address to) external onlyOwner nonReentrant {
         uint256 amount = s_accumulatedFees;
         if (amount == 0) revert Lottery__NothingToWithdraw();
 
@@ -355,10 +372,6 @@ contract Lottery is VRFConsumerBaseV2Plus {
     function getRound(uint256 roundId) external view returns (Round memory) {
         return s_rounds[roundId];
     }
-
-    // ─────────────────────────────────────────────
-    // External — View
-    // ─────────────────────────────────────────────
 
     function getCurrentRoundId() external view returns (uint256) {
         return s_currentRoundId;
@@ -390,6 +403,10 @@ contract Lottery is VRFConsumerBaseV2Plus {
 
     function getRoundPayouts(uint256 roundId) external view returns (uint256[3] memory) {
         return s_rounds[roundId].payouts;
+    }
+
+    function getClaimablePrize(address player) external view returns (uint256) {
+        return s_claimablePrizes[player];
     }
 
     // ─────────────────────────────────────────────
@@ -443,10 +460,9 @@ contract Lottery is VRFConsumerBaseV2Plus {
 
         emit ProtocolFeeCollected(roundId, protocolFee);
 
-        // Transfer prizes (Interactions last — CEI)
+        // Credit prizes to winners (Pull over Push)
         for (uint256 i; i < numWinners;) {
-            (bool ok,) = payable(r.winners[i]).call{value: payouts[i]}("");
-            if (!ok) revert Lottery__TransferFailed(r.winners[i], payouts[i]);
+            s_claimablePrizes[selected[i]] += payouts[i];
             unchecked {
                 ++i;
             }

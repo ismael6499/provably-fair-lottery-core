@@ -370,7 +370,7 @@ contract LotteryTest is Test {
         assertEq(r.payouts[1], expectedSecond);
         assertEq(r.payouts[2], expectedThird);
 
-        // Each winner should have received their payout
+        // Winners must claim using Pull Payments
         for (uint256 i; i < 3; ++i) {
             address winner = r.winners[i];
             uint256 balBefore;
@@ -378,7 +378,14 @@ contract LotteryTest is Test {
             else if (winner == PLAYER2) balBefore = bal2Before;
             else balBefore = bal3Before;
 
+            uint256 claimable = lottery.getClaimablePrize(winner);
+            assertEq(claimable, r.payouts[i]);
+
+            vm.prank(winner);
+            lottery.claimPrize();
+
             assertEq(winner.balance, balBefore + r.payouts[i]);
+            assertEq(lottery.getClaimablePrize(winner), 0);
         }
     }
 
@@ -445,6 +452,8 @@ contract LotteryTest is Test {
             assertTrue(
                 winners[i] == PLAYER1 || winners[i] == PLAYER2 || winners[i] == PLAYER3
             );
+            vm.prank(winners[i]);
+            lottery.claimPrize();
         }
     }
 
@@ -476,6 +485,12 @@ contract LotteryTest is Test {
         uint256 fee = (totalPool * PROTOCOL_FEE_BPS) / 10_000;
         uint256 distributable = totalPool - fee;
         assertEq(r.payouts[0] + r.payouts[1] + r.payouts[2], distributable);
+
+        // Claim
+        for (uint256 i; i < 3; ++i) {
+            vm.prank(r.winners[i]);
+            lottery.claimPrize();
+        }
     }
 
     // ═════════════════════════════════════════════
@@ -558,6 +573,10 @@ contract LotteryTest is Test {
         assertEq(uint256(r.state), uint256(Lottery.RoundState.CLOSED));
         assertTrue(r.refunded);
     }
+
+    // ═════════════════════════════════════════════
+    // Category 7: Refund Mechanism
+    // ═════════════════════════════════════════════
 
     function test_requestDrawRefundsTwoPlayers() public {
         _startRound();
@@ -750,6 +769,10 @@ contract LotteryTest is Test {
         assertEq(lottery.getAccumulatedFees(), 0);
     }
 
+    // ═════════════════════════════════════════════
+    // Category 9: Protocol Fee Withdrawal
+    // ═════════════════════════════════════════════
+
     function test_withdrawFeesEmitsEvent() public {
         uint256 requestId = _startRoundAndRequestDraw(3);
         vrfCoordinator.fulfillRandomWords(requestId, address(lottery));
@@ -839,6 +862,10 @@ contract LotteryTest is Test {
         assertEq(r.payouts[1], 0);
         assertEq(r.payouts[2], 0);
 
+        // Claim
+        vm.prank(PLAYER1);
+        singleLottery.claimPrize();
+
         assertEq(PLAYER1.balance, balBefore + r.payouts[0]);
     }
 
@@ -879,6 +906,18 @@ contract LotteryTest is Test {
 
         assertTrue(r.winners[0] != r.winners[1]);
         assertEq(r.winners[2], address(0));
+
+        // Claim and verify balances
+        for (uint256 i; i < 2; ++i) {
+            address winner = r.winners[i];
+            uint256 payout = r.payouts[i];
+            uint256 balBefore = winner.balance;
+
+            vm.prank(winner);
+            twoPlayerLottery.claimPrize();
+
+            assertEq(winner.balance, balBefore + payout);
+        }
     }
 
     function test_manyPlayersWinnersFromPool() public {
@@ -904,6 +943,12 @@ contract LotteryTest is Test {
         assertTrue(r.winners[0] != r.winners[1]);
         assertTrue(r.winners[1] != r.winners[2]);
         assertTrue(r.winners[0] != r.winners[2]);
+
+        // Claim
+        for (uint256 i; i < 3; ++i) {
+            vm.prank(r.winners[i]);
+            lottery.claimPrize();
+        }
     }
 
     // ═════════════════════════════════════════════
@@ -968,6 +1013,47 @@ contract LotteryTest is Test {
     }
 
     // ═════════════════════════════════════════════
+    // Category 12: Pull Payments & Security Verification
+    // ═════════════════════════════════════════════
+
+    function test_claimPrizeRevertsIfNothingToClaim() public {
+        vm.prank(PLAYER1);
+        vm.expectRevert(Lottery.Lottery__NothingToWithdraw.selector);
+        lottery.claimPrize();
+    }
+
+    function test_claimPrizeReentrancyGuard() public {
+        ReentrancyAttacker attacker = new ReentrancyAttacker(address(lottery));
+        vm.deal(address(attacker), 1 ether);
+
+        _startRound();
+        
+        vm.prank(PLAYER1);
+        lottery.buyTickets{value: TICKET_PRICE}(1);
+        vm.prank(PLAYER2);
+        lottery.buyTickets{value: TICKET_PRICE}(1);
+        
+        attacker.attack{value: TICKET_PRICE}();
+
+        vm.warp(block.timestamp + ROUND_DURATION + 1);
+        lottery.requestDraw(1);
+
+        Lottery.Round memory r = lottery.getRound(1);
+        
+        // Force attacker to be winner
+        uint256[] memory specificWords = new uint256[](3);
+        specificWords[0] = 2; // will pick attacker
+        specificWords[1] = 0;
+        specificWords[2] = 1;
+        
+        vrfCoordinator.fulfillRandomWordsWithOverride(r.vrfRequestId, address(lottery), specificWords);
+
+        // Attempting to claim must revert during reentry
+        vm.expectRevert();
+        attacker.claimPrize();
+    }
+
+    // ═════════════════════════════════════════════
     // Test Helpers
     // ═════════════════════════════════════════════
 
@@ -998,5 +1084,33 @@ contract LotteryTest is Test {
 
         Lottery.Round memory r = lottery.getRound(1);
         return r.vrfRequestId;
+    }
+}
+
+// ─────────────────────────────────────────────
+// Reentrancy Attacker Mock Contract
+// ─────────────────────────────────────────────
+
+contract ReentrancyAttacker {
+    Lottery private immutable i_lottery;
+    bool private s_attacked;
+
+    constructor(address _lottery) {
+        i_lottery = Lottery(_lottery);
+    }
+
+    function attack() external payable {
+        i_lottery.buyTickets{value: msg.value}(1);
+    }
+
+    function claimPrize() external {
+        i_lottery.claimPrize();
+    }
+
+    receive() external payable {
+        if (!s_attacked) {
+            s_attacked = true;
+            i_lottery.claimPrize();
+        }
     }
 }
