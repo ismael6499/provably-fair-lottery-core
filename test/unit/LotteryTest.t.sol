@@ -1012,6 +1012,30 @@ contract LotteryTest is Test {
         assertEq(r.payouts[0] + r.payouts[1] + r.payouts[2] + r.protocolFeeCollected, r.prizePool);
     }
 
+    function testFuzz_fulfillRandomWords_SelectsWinnersCorrectly(uint256 word0, uint256 word1, uint256 word2) public {
+        uint256 requestId = _startRoundAndRequestDraw(3);
+
+        uint256[] memory specificWords = new uint256[](3);
+        specificWords[0] = word0;
+        specificWords[1] = word1;
+        specificWords[2] = word2;
+
+        vrfCoordinator.fulfillRandomWordsWithOverride(requestId, address(lottery), specificWords);
+
+        Lottery.Round memory r = lottery.getRound(1);
+        assertEq(uint256(r.state), uint256(Lottery.RoundState.CLOSED));
+        assertTrue(r.winners[0] != address(0));
+        assertTrue(r.winners[1] != address(0));
+        assertTrue(r.winners[2] != address(0));
+    }
+
+    function testFuzz_setProtocolFee_UpdatesConfig(uint16 newFeeBps) public {
+        newFeeBps = uint16(bound(newFeeBps, 0, 1000));
+        vm.prank(OWNER);
+        lottery.setProtocolFee(newFeeBps);
+        assertEq(lottery.getConfig().protocolFeeBps, newFeeBps);
+    }
+
     // ═════════════════════════════════════════════
     // Category 12: Pull Payments & Security Verification
     // ═════════════════════════════════════════════
