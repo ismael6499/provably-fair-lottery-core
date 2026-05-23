@@ -109,6 +109,27 @@ contract LotteryTest is Test {
         new Lottery(address(vrfCoordinator), KEY_HASH, subscriptionId, CALLBACK_GAS_LIMIT, 0, ROUND_DURATION, MAX_TICKETS_PER_PLAYER, MIN_PLAYERS, PROTOCOL_FEE_BPS);
     }
 
+    function test_constructorRevertsOnZeroRoundDuration() public {
+        vm.expectRevert(Lottery.Lottery__InvalidRoundDuration.selector);
+        new Lottery(address(vrfCoordinator), KEY_HASH, subscriptionId, CALLBACK_GAS_LIMIT, TICKET_PRICE, 0, MAX_TICKETS_PER_PLAYER, MIN_PLAYERS, PROTOCOL_FEE_BPS);
+    }
+
+    function test_constructorRevertsOnZeroMaxTickets() public {
+        vm.expectRevert(Lottery.Lottery__InvalidMaxTickets.selector);
+        new Lottery(address(vrfCoordinator), KEY_HASH, subscriptionId, CALLBACK_GAS_LIMIT, TICKET_PRICE, ROUND_DURATION, 0, MIN_PLAYERS, PROTOCOL_FEE_BPS);
+    }
+
+    function test_constructorRevertsOnZeroMinPlayers() public {
+        vm.expectRevert(Lottery.Lottery__InvalidMinPlayers.selector);
+        new Lottery(address(vrfCoordinator), KEY_HASH, subscriptionId, CALLBACK_GAS_LIMIT, TICKET_PRICE, ROUND_DURATION, MAX_TICKETS_PER_PLAYER, 0, PROTOCOL_FEE_BPS);
+    }
+
+    function test_constructorRevertsOnExcessiveProtocolFee() public {
+        vm.expectRevert(Lottery.Lottery__InvalidProtocolFee.selector);
+        new Lottery(address(vrfCoordinator), KEY_HASH, subscriptionId, CALLBACK_GAS_LIMIT, TICKET_PRICE, ROUND_DURATION, MAX_TICKETS_PER_PLAYER, MIN_PLAYERS, 1001);
+    }
+
+
     // ═════════════════════════════════════════════
     // Category 2: Round Management
     // ═════════════════════════════════════════════
@@ -719,6 +740,18 @@ contract LotteryTest is Test {
         lottery.withdrawFees(PLAYER1);
     }
 
+    function test_transferOwnership_Succeeds() public {
+        address newOwner = makeAddr("newOwner");
+        vm.prank(OWNER);
+        lottery.transferOwnership(newOwner);
+        assertEq(lottery.owner(), OWNER); // still owner until accepted
+
+        vm.prank(newOwner);
+        lottery.acceptOwnership();
+        assertEq(lottery.owner(), newOwner);
+    }
+
+
     function test_ownerCanUpdateConfig() public {
         vm.startPrank(OWNER);
         lottery.setTicketPrice(0.05 ether);
@@ -741,6 +774,25 @@ contract LotteryTest is Test {
         vm.expectRevert(Lottery.Lottery__InvalidTicketPrice.selector);
         lottery.setTicketPrice(0);
     }
+
+    function test_setRoundDurationRevertsOnZero() public {
+        vm.prank(OWNER);
+        vm.expectRevert(Lottery.Lottery__InvalidRoundDuration.selector);
+        lottery.setRoundDuration(0);
+    }
+
+    function test_setMaxTicketsPerPlayerRevertsOnZero() public {
+        vm.prank(OWNER);
+        vm.expectRevert(Lottery.Lottery__InvalidMaxTickets.selector);
+        lottery.setMaxTicketsPerPlayer(0);
+    }
+
+    function test_setMinPlayersRevertsOnZero() public {
+        vm.prank(OWNER);
+        vm.expectRevert(Lottery.Lottery__InvalidMinPlayers.selector);
+        lottery.setMinPlayers(0);
+    }
+
 
     function test_setProtocolFeeRevertsOnExcessive() public {
         vm.prank(OWNER);
@@ -1078,6 +1130,88 @@ contract LotteryTest is Test {
     }
 
     // ═════════════════════════════════════════════
+    // Category 13: Failed Transfer Edge Cases
+    // ═════════════════════════════════════════════
+
+    function test_buyTicketsRevertsOnFailedExcessRefund() public {
+        RevertingRecipient recipient = new RevertingRecipient(address(lottery));
+        _startRound();
+
+        vm.deal(address(recipient), 1 ether);
+        
+        // Buy 1 ticket for TICKET_PRICE (0.01 ether) but send 0.02 ether (1 ticket + overpay)
+        // Since it overpays, buyTickets tries to refund the excess to recipient.
+        // Recipient rejects the Ether, so buyTickets should revert with Lottery__TransferFailed!
+        vm.expectRevert(abi.encodeWithSelector(Lottery.Lottery__TransferFailed.selector, address(recipient), 0.01 ether));
+        recipient.buyTickets{value: 0.02 ether}(1);
+    }
+
+    function test_claimRefundRevertsOnFailedTransfer() public {
+        RevertingRecipient recipient = new RevertingRecipient(address(lottery));
+        _startRound();
+
+        vm.deal(address(recipient), 1 ether);
+        
+        // Buy 1 ticket exactly
+        recipient.buyTickets{value: TICKET_PRICE}(1);
+
+        // Warp past round end and trigger refund path (since only 1 player entered)
+        vm.warp(block.timestamp + ROUND_DURATION + 1);
+        lottery.requestDraw(1);
+
+        // When recipient claims refund, the transfer fails, so it reverts!
+        vm.expectRevert(abi.encodeWithSelector(Lottery.Lottery__TransferFailed.selector, address(recipient), TICKET_PRICE));
+        recipient.claimRefund(1);
+    }
+
+    function test_claimPrizeRevertsOnFailedTransfer() public {
+        RevertingRecipient recipient = new RevertingRecipient(address(lottery));
+        _startRound();
+
+        vm.deal(address(recipient), 1 ether);
+        recipient.buyTickets{value: TICKET_PRICE}(1);
+
+        // Add 2 other players to meet minimum requirement and trigger normal draw
+        _buyTicketsForPlayer(PLAYER2, 1);
+        _buyTicketsForPlayer(PLAYER3, 1);
+
+        vm.warp(block.timestamp + ROUND_DURATION + 1);
+        lottery.requestDraw(1);
+
+        // Fulfill VRF, making recipient the winner
+        Lottery.Round memory r = lottery.getRound(1);
+        
+        uint256[] memory specificWords = new uint256[](3);
+        specificWords[0] = 0; // recipient is player 0 in uniquePlayers, so recipient wins 1st prize
+        specificWords[1] = 1;
+        specificWords[2] = 2;
+
+        vrfCoordinator.fulfillRandomWordsWithOverride(r.vrfRequestId, address(lottery), specificWords);
+
+        uint256 payout = lottery.getClaimablePrize(address(recipient));
+
+        // When recipient tries to claim the prize, the transfer fails!
+        vm.expectRevert(abi.encodeWithSelector(Lottery.Lottery__TransferFailed.selector, address(recipient), payout));
+        recipient.claimPrize();
+    }
+
+    function test_withdrawFeesRevertsOnFailedTransfer() public {
+        RevertingRecipient recipient = new RevertingRecipient(address(lottery));
+        
+        // Accumulate some fees
+        uint256 requestId = _startRoundAndRequestDraw(3);
+        vrfCoordinator.fulfillRandomWords(requestId, address(lottery));
+
+        uint256 fees = lottery.getAccumulatedFees();
+        assertTrue(fees > 0);
+
+        // Attempting to withdraw fees to reverting recipient fails!
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(Lottery.Lottery__TransferFailed.selector, address(recipient), fees));
+        lottery.withdrawFees(address(recipient));
+    }
+
+    // ═════════════════════════════════════════════
     // Test Helpers
     // ═════════════════════════════════════════════
 
@@ -1138,3 +1272,33 @@ contract ReentrancyAttacker {
         }
     }
 }
+
+// ─────────────────────────────────────────────
+// Reverting Recipient Mock Contract
+// ─────────────────────────────────────────────
+
+contract RevertingRecipient {
+    Lottery private immutable i_lottery;
+
+    constructor(address _lottery) {
+        i_lottery = Lottery(_lottery);
+    }
+
+    function buyTickets(uint256 quantity) external payable {
+        i_lottery.buyTickets{value: msg.value}(quantity);
+    }
+
+    function claimRefund(uint256 roundId) external {
+        i_lottery.claimRefund(roundId);
+    }
+
+    function claimPrize() external {
+        i_lottery.claimPrize();
+    }
+
+    // Reverts on any Ether receipt
+    fallback() external payable {
+        revert("I reject Ether");
+    }
+}
+
